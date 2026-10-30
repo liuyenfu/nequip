@@ -88,7 +88,8 @@ class TestNequIPModel(
         return False
 
     @pytest.fixture(scope="class")
-    def equivariance_tol(self, model_dtype):
+    @classmethod
+    def equivariance_tol(cls, model_dtype):
         return {"float32": 5e-5, "float64": 1e-7}[model_dtype]
 
     @pytest.fixture(
@@ -100,7 +101,8 @@ class TestNequIPModel(
         ],
         scope="class",
     )
-    def config(self, request):
+    @classmethod
+    def config(cls, request):
         config = request.param
         config = config.copy()
         return config
@@ -111,7 +113,8 @@ class TestNequIPModel(
         + (["enable_OpenEquivariance"] if _TORCH_GE_2_7 and _OEQ_INSTALLED else [])
         + (["enable_CuEquivariance"] if _CUEQ_INSTALLED else []),
     )
-    def ase_compile_modifiers(self, request):
+    @classmethod
+    def ase_compile_modifiers(cls, request):
         """Test acceleration modifiers in ASE integration compile workflows."""
         if request.param is None:
             # for base NequIP models (no modifiers), skip CPU+aotinductor for PyTorch 2.10.0
@@ -127,7 +130,6 @@ class TestNequIPModel(
 
         def modifier_handler(mode, device, model_dtype):
             if request.param == "enable_OpenEquivariance":
-                import openequivariance  # noqa: F401,F811
                 from nequip.utils.versions import _TORCH_GE_2_9
 
                 # OEQ + AOTI requires PyTorch >= 2.9
@@ -139,9 +141,6 @@ class TestNequIPModel(
 
                 return ["enable_OpenEquivariance"]
             elif request.param == "enable_CuEquivariance":
-                import cuequivariance  # noqa: F401,F811
-                import cuequivariance_torch  # noqa: F401,F811
-
                 if model_dtype == "float64":
                     pytest.skip("CuEq tests skipped for f64 models")
 
@@ -160,7 +159,8 @@ class TestNequIPModel(
         + (["enable_OpenEquivariance"] if _TORCH_GE_2_7 and _OEQ_INSTALLED else [])
         + (["enable_CuEquivariance"] if _CUEQ_INSTALLED else []),
     )
-    def torchsim_compile_modifiers(self, request):
+    @classmethod
+    def torchsim_compile_modifiers(cls, request):
         """Test acceleration modifiers in torch-sim compile workflows."""
         if request.param is None:
 
@@ -175,7 +175,6 @@ class TestNequIPModel(
 
         def modifier_handler(mode, device, model_dtype):
             if request.param == "enable_OpenEquivariance":
-                import openequivariance  # noqa: F401,F811
                 from nequip.utils.versions import _TORCH_GE_2_9
 
                 if mode == "aotinductor" and not _TORCH_GE_2_9:
@@ -184,9 +183,6 @@ class TestNequIPModel(
                     pytest.skip("OEQ tests skipped for CPU")
                 return ["enable_OpenEquivariance"]
             elif request.param == "enable_CuEquivariance":
-                import cuequivariance  # noqa: F401,F811
-                import cuequivariance_torch  # noqa: F401,F811
-
                 if model_dtype == "float64":
                     pytest.skip("CuEq tests skipped for f64 models")
                 if device == "cpu":
@@ -204,23 +200,19 @@ class TestNequIPModel(
         # + (["enable_CuEquivariance"] if _CUEQ_INSTALLED else []),
         # NOTE: ^ some tests fail with CuEq
     )
-    def train_time_compile_modifiers(self, request):
+    @classmethod
+    def train_time_compile_modifiers(cls, request):
         """Test acceleration modifiers in train-time compile workflows."""
         if request.param is None:
             return None
 
         def modifier_handler(device, model_dtype):
             if request.param == "enable_OpenEquivariance":
-                import openequivariance  # noqa: F401,F811
-
                 if device == "cpu":
                     pytest.skip("OEQ tests skipped for CPU")
 
                 return [{"modifier": "enable_OpenEquivariance"}]
             elif request.param == "enable_CuEquivariance":
-                import cuequivariance  # noqa: F401,F811
-                import cuequivariance_torch  # noqa: F401,F811
-
                 if device == "cpu":
                     pytest.skip("CuEq tests skipped for CPU")
 
@@ -236,7 +228,8 @@ class TestNequIPModel(
         + (["enable_OpenEquivariance"] if _TORCH_GE_2_7 and _OEQ_INSTALLED else [])
         + (["enable_CuEquivariance"] if _CUEQ_INSTALLED else []),
     )
-    def mliap_acceleration_modifiers(self, request):
+    @classmethod
+    def mliap_acceleration_modifiers(cls, request):
         """Test acceleration modifiers in MLIAP workflows."""
 
         def modifier_handler(compile, model_dtype):
@@ -247,13 +240,8 @@ class TestNequIPModel(
             if request.param is None:
                 return []
             elif request.param == "enable_OpenEquivariance":
-                import openequivariance  # noqa: F401,F811
-
                 return ["enable_OpenEquivariance"]
             elif request.param == "enable_CuEquivariance":
-                import cuequivariance  # noqa: F401,F811
-                import cuequivariance_torch  # noqa: F401,F811
-
                 if model_dtype == "float64":
                     pytest.skip("CuEq tests skipped for f64 models")
 

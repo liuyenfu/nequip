@@ -11,7 +11,7 @@ from nequip.data._nl import NEIGHBORLIST_BACKEND_ALCHEMIOPS
 from .mixins import _IntegrationLoaderMixin
 
 from collections.abc import Callable
-from typing import Union, List, Dict, Optional
+from typing import Any, Union, List, Dict, Optional
 from pathlib import Path
 
 
@@ -107,6 +107,7 @@ class NequIPTorchSimCalc(_IntegrationLoaderMixin, ModelInterface):
         device: Union[str, torch.device] = "cpu",
         chemical_species_to_atom_type_map: Optional[Union[Dict[str, str], bool]] = None,
         neighborlist_backend: str = NEIGHBORLIST_BACKEND_ALCHEMIOPS,
+        neighborlist_backend_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         return super().from_compiled_model(
@@ -114,6 +115,7 @@ class NequIPTorchSimCalc(_IntegrationLoaderMixin, ModelInterface):
             device=device,
             chemical_species_to_atom_type_map=chemical_species_to_atom_type_map,
             neighborlist_backend=neighborlist_backend,
+            neighborlist_backend_kwargs=neighborlist_backend_kwargs,
             **kwargs,
         )
 
@@ -183,8 +185,10 @@ class NequIPTorchSimCalc(_IntegrationLoaderMixin, ModelInterface):
             # previously, pbc is a bool
             pbc = torch.tensor([pbc] * 3, dtype=torch.bool, device=self._device)
         # after PR, pbc is already a tensor with shape [3]
+        # n_systems from the per-system cell's batch dim
+        n_systems = sim_state.cell.shape[0]
         # expand to [n_systems, 3] for batched processing
-        pbc_tensor = pbc.unsqueeze(0).expand(self.n_systems, 3)
+        pbc_tensor = pbc.unsqueeze(0).expand(n_systems, 3)
 
         data: dict[str, torch.Tensor] = {
             AtomicDataDict.POSITIONS_KEY: sim_state.positions,
@@ -199,6 +203,14 @@ class NequIPTorchSimCalc(_IntegrationLoaderMixin, ModelInterface):
         for t in self.transforms:
             data = t(data)
 
+        # the AOTI-compiled model reads inputs by assumed (compile-time) stride and does not guard runtime strides.
+        # several torch-sim tensors are non-contiguous views (e.g. row_vector_cell = cell.mT;
+        # expanded pbc is stride-0), which would be read silently transposed/garbled,
+        # so force all model inputs contiguous.
+        data = {
+            k: (v.contiguous() if torch.is_tensor(v) else v) for k, v in data.items()
+        }
+
         # === run model ===
         out = self.model(data)
 
@@ -209,7 +221,7 @@ class NequIPTorchSimCalc(_IntegrationLoaderMixin, ModelInterface):
         if energy is not None:
             results["energy"] = energy.view(-1).detach()
         else:
-            results["energy"] = torch.zeros(self.n_systems, device=self._device)
+            results["energy"] = torch.zeros(n_systems, device=self._device)
 
         if self.compute_forces:
             forces = out[AtomicDataDict.FORCE_KEY]

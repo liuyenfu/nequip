@@ -4,6 +4,10 @@
 The [Atomic Simulation Environment (ASE)](https://wiki.fysik.dtu.dk/ase/) is a popular Python package providing a framework for working with atomic data, reading and writing common formats, and running various simulations and calculations.
 NequIP provides the {class}`~nequip.integrations.ase.NequIPCalculator` for integration with ASE. See the [ASE calculator API](../api/ase.rst) for detailed documentation.
 
+```{tip}
+Molecular dynamics speeds through the ASE and [LAMMPS](lammps/index.md) interfaces are benchmarked directly against each other, over a range of system sizes and models, in the [NequIP foundation potentials paper](https://doi.org/10.48550/arXiv.2607.28461).
+```
+
 ## Creating an ASE Calculator
 
 To use a NequIP framework model with ASE, you need to follow these steps:
@@ -59,13 +63,13 @@ calculator = NequIPCalculator.from_compiled_model(
 )
 ```
 
-**Custom mapping:** If the model uses non-standard type names (e.g., charge states, coarse-grained types), provide an explicit mapping dict:
+**Custom mapping:** If the model uses custom type names that differ from chemical symbols, provide an explicit mapping dict:
 
 ```python
 calculator = NequIPCalculator.from_compiled_model(
     compile_path="path/to/compiled_model.nequip.pt2",
     device="cuda",
-    chemical_species_to_atom_type_map={"H": "H+", "C": "C_sp3", "O": "O-"}
+    chemical_species_to_atom_type_map={"H": "my_H", "C": "my_C", "O": "my_O"}
 )
 ```
 

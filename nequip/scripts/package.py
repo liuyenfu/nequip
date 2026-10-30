@@ -6,27 +6,29 @@ from nequip.model.saved_models.package import (
     _get_shared_importer,
     _get_package_metadata,
     _suppress_package_importer_exporter_warnings,
+    _cpu_deserialize_always,
 )
 from nequip.model.saved_models import load_saved_model
-from nequip.model.utils import (
-    _COMPILE_MODE_OPTIONS,
-    _EAGER_MODEL_KEY,
-)
+from nequip.model.utils import _EAGER_MODEL_KEY
 from nequip.nn.model_modifier_utils import (
     is_persistent_model_modifier,
     is_private_model_modifier,
 )
-from nequip.model.modify_utils import get_all_modifiers
+from nequip.model.modify_utils import get_all_modifiers, modify
 from nequip.utils.logger import RankedLogger
-from nequip.utils.versions import get_current_code_versions, _TORCH_GE_2_6
+from nequip.utils.versions import get_current_code_versions
 from nequip.utils.versions.version_utils import get_version_safe
 from nequip.utils.global_state import set_global_state
+from nequip.utils.asserts import assert_package_extension
+from nequip.utils.dtype import test_model_output_similarity_by_dtype
+from nequip.train.lightning import _SOLE_MODEL_KEY
 
 from ._workflow_utils import set_workflow_state
 from ._package_utils import (
     _EXTERNAL_MODULES,
     _MOCK_MODULES,
     _INTERNAL_MODULES,
+    _PACKAGING_MODES,
 )
 
 from omegaconf import OmegaConf
@@ -34,6 +36,12 @@ import hydra
 import argparse
 import pathlib
 import yaml
+import zipfile
+import difflib
+import importlib.util
+import shutil
+import sys
+import tempfile
 
 
 # === setup logging ===
@@ -72,6 +80,79 @@ def main(args=None):
         help="output path to save the packaged model. NOTE: a `.nequip.zip` extension is mandatory",
         type=pathlib.Path,
     )
+    build_parser.add_argument(
+        "--mode",
+        help="packaging mode controlling which compile modes are included (default: nequip)",
+        type=str,
+        default="nequip",
+    )
+
+    subparsers.add_parser("modes", help="list available packaging modes")
+
+    list_parser = subparsers.add_parser(
+        "list", help="list files inside a packaged model file"
+    )
+    list_parser.add_argument(
+        "pkg_path",
+        help="path to package file",
+        type=str,
+    )
+
+    diff_parser = subparsers.add_parser(
+        "diff",
+        help="diff a file inside a packaged model against an installed or local file",
+    )
+    diff_parser.add_argument("pkg_path", type=str, help="path to package file")
+    diff_parser.add_argument(
+        "zip_path",
+        type=str,
+        help="path of the file inside the zip (as shown by `nequip-package list`)",
+    )
+    diff_parser.add_argument(
+        "local_file",
+        type=str,
+        nargs="?",
+        default=None,
+        help="local file to compare against; if omitted, auto-resolved from the installed package",
+    )
+
+    update_parser = subparsers.add_parser(
+        "update",
+        help="replace files in a packaged model and verify predictions are unchanged",
+    )
+    update_parser.add_argument(
+        "input_path", type=pathlib.Path, help="path to input package file"
+    )
+    update_parser.add_argument(
+        "output_path", type=pathlib.Path, help="path to output package file"
+    )
+    update_parser.add_argument(
+        "--replace",
+        action="append",
+        default=[],
+        nargs="+",
+        metavar="ZIP_PATH",
+        help="replace a file inside the zip; optionally follow with LOCAL_FILE, otherwise auto-resolved from the installed package. May be specified multiple times.",
+    )
+
+    modify_parser = subparsers.add_parser(
+        "modify",
+        help="apply a persistent model modifier to a packaged model",
+    )
+    modify_parser.add_argument(
+        "input_path", type=pathlib.Path, help="path to input package file"
+    )
+    modify_parser.add_argument(
+        "output_path", type=pathlib.Path, help="path to output package file"
+    )
+    modify_parser.add_argument(
+        "--modifier",
+        action="append",
+        default=[],
+        nargs="+",
+        metavar="MODIFIER_NAME",
+        help="modifier to apply; optionally follow with key=value kwargs (values are YAML-parsed). May be specified multiple times.",
+    )
 
     info_parser = subparsers.add_parser(
         "info", help="get information from a packaged model file"
@@ -95,10 +176,339 @@ def main(args=None):
 
     args = parser.parse_args(args=args)
 
-    if args.command == "info":
-        assert str(args.pkg_path).endswith(".nequip.zip"), (
-            "packed model file to inspect must end with the `.nequip.zip` extension"
+    def _resolve_local_path(zip_path: str) -> pathlib.Path:
+        """Resolve a zip-internal path to its installed-package counterpart.
+
+        zip paths look like "<pkg_dir>/<top_level_module>/a/b/c.py";
+        strip <pkg_dir>, find <top_level_module> in the current env via importlib.
+        """
+        parts = pathlib.PurePosixPath(zip_path).parts
+        if len(parts) < 3:
+            parser.error(
+                f"cannot auto-resolve `{zip_path}`; provide a local file path explicitly"
+            )
+        top_level = parts[1]
+        spec = importlib.util.find_spec(top_level)
+        if spec is None or not spec.submodule_search_locations:
+            parser.error(
+                f"cannot auto-resolve: `{top_level}` is not an installed package; "
+                f"provide a local file path explicitly"
+            )
+        return pathlib.Path(spec.submodule_search_locations[0]).joinpath(*parts[2:])
+
+    if args.command == "modes":
+        print("Available packaging modes:")
+        for name, fn in _PACKAGING_MODES.items():
+            print(f"  {name}\t{fn()}")
+        return
+
+    elif args.command == "list":
+        assert_package_extension(args.pkg_path)
+        with zipfile.ZipFile(args.pkg_path, "r") as zf:
+            for info in sorted(zf.infolist(), key=lambda x: x.filename):
+                if not info.filename.endswith(".storage"):
+                    print(f"{info.file_size:>12}  {info.filename}")
+        return
+
+    elif args.command == "diff":
+        assert_package_extension(args.pkg_path)
+
+        # read file from the zip archive
+        with zipfile.ZipFile(args.pkg_path, "r") as zf:
+            pkg_bytes = zf.read(args.zip_path)
+
+        # resolve the local counterpart to compare against
+        if args.local_file is not None:
+            local_path = pathlib.Path(args.local_file)
+        else:
+            local_path = _resolve_local_path(args.zip_path)
+
+        if not local_path.exists():
+            parser.error(f"local file not found: {local_path}")
+
+        diff = list(
+            difflib.unified_diff(
+                pkg_bytes.decode("utf-8").splitlines(keepends=True),
+                local_path.read_text(encoding="utf-8").splitlines(keepends=True),
+                fromfile=f"{args.zip_path} (package)",
+                tofile=str(local_path),
+            )
         )
+        # colorize when writing to a terminal: green=added, red=removed, cyan=hunk headers
+        if diff and sys.stdout.isatty():
+            _RESET, _RED, _GREEN, _CYAN = "\033[0m", "\033[31m", "\033[32m", "\033[36m"
+            diff = [
+                (
+                    _GREEN
+                    if l.startswith("+")
+                    else _RED
+                    if l.startswith("-")
+                    else _CYAN
+                    if l.startswith("@")
+                    else ""
+                )
+                + l
+                + (_RESET if l[0] in "+-@" else "")
+                for l in diff
+            ]
+        sys.stdout.writelines(diff if diff else ["(no differences)\n"])
+
+        return
+
+    elif args.command == "update":
+        assert_package_extension(args.input_path, "input package path")
+        assert_package_extension(args.output_path, "output package path")
+        assert args.input_path.resolve() != args.output_path.resolve(), (
+            "input and output paths must differ"
+        )
+
+        # parse --replace ZIP_PATH [LOCAL_FILE] pairs
+        # .py files → surgical source replacement via save_source_string
+        # other files → text resource substitution (e.g. model/config.yaml)
+        py_replacements = {}  # {module_name: (src_str, is_package)}
+        text_replacements = {}  # {(package, resource): pathlib.Path}
+        for item in args.replace:
+            if len(item) == 1:
+                zip_path = item[0]
+                local_path = _resolve_local_path(zip_path)
+            elif len(item) == 2:
+                zip_path, local_file = item
+                local_path = pathlib.Path(local_file)
+            else:
+                parser.error(
+                    f"--replace takes 1 or 2 arguments, got {len(item)}: {item}"
+                )
+            parts = pathlib.PurePosixPath(zip_path).parts
+            if len(parts) < 3:
+                parser.error(
+                    f"cannot parse zip path `{zip_path}`; expected <pkg_dir>/<package>/<resource>"
+                )
+            rel_path = "/".join(parts[1:])  # strip <pkg_dir>
+            if rel_path.endswith(".py"):
+                content = local_path.read_text(encoding="utf-8")
+                if rel_path.endswith("/__init__.py"):
+                    module_name = rel_path[: -len("/__init__.py")].replace("/", ".")
+                    is_pkg = True
+                else:
+                    module_name = rel_path[:-3].replace("/", ".")
+                    is_pkg = False
+                py_replacements[module_name] = (content, is_pkg)
+            else:
+                pkg_name, resource = parts[1], "/".join(parts[2:])
+                text_replacements[(pkg_name, resource)] = local_path
+
+        # get reference predictions from the original package
+        with _suppress_package_importer_exporter_warnings():
+            old_imp = torch.package.PackageImporter(args.input_path)
+            pkg_metadata = _get_package_metadata(old_imp)
+            with _cpu_deserialize_always():
+                old_example_data = old_imp.load_pickle("model", "example_data.pkl")
+                old_module_dict = old_imp.load_pickle(
+                    package="model",
+                    resource=f"{_EAGER_MODEL_KEY}_model.pkl",
+                    map_location="cpu",
+                )
+        ref_model = old_module_dict[_SOLE_MODEL_KEY]
+        ref_model.eval()
+        model_dtype = ref_model.model_dtype
+        available_models = pkg_metadata["available_models"]
+
+        # write to a tempfile so a failed verification never produces a bad output file
+        with tempfile.NamedTemporaryFile(suffix=".nequip.zip", delete=False) as tmp:
+            tmp_path = pathlib.Path(tmp.name)
+        try:
+            # re-package via PackageExporter:
+            # - unchanged Python source comes from old_imp (first in importer chain)
+            # - .py replacements are injected via save_source_string before intern resolution;
+            #   save_pickle(dependencies=True) skips modules already in the package, so
+            #   the injected source wins and intern leaves them alone
+            with _suppress_package_importer_exporter_warnings():
+                importers = (old_imp, torch.package.importer.sys_importer)
+                with torch.package.PackageExporter(tmp_path, importer=importers) as exp:
+                    exp.mock([f"{pkg}.**" for pkg in _MOCK_MODULES])
+                    exp.extern([f"{pkg}.**" for pkg in _EXTERNAL_MODULES])
+                    exp.intern([f"{pkg}.**" for pkg in _INTERNAL_MODULES])
+
+                    # inject .py replacements before pickle saving so intern won't overwrite them
+                    for module_name, (src, is_pkg) in py_replacements.items():
+                        logger.info(
+                            f"Replacing {module_name.replace('.', '/')}"
+                            f"{'/__init__' if is_pkg else ''}.py"
+                        )
+                        exp.save_source_string(module_name, src, is_package=is_pkg)
+
+                    # example data: always carry over from old package
+                    exp.save_pickle(
+                        "model", "example_data.pkl", old_example_data, dependencies=True
+                    )
+
+                    # text resources: carry over from old package, substituting replacements
+                    unused_text = set(text_replacements.keys())
+                    for resource in ["config.yaml", "package_metadata.txt"]:
+                        key = ("model", resource)
+                        if key in text_replacements:
+                            content = text_replacements[key].read_text(encoding="utf-8")
+                            logger.info(
+                                f"Replacing model/{resource} from {text_replacements[key]}"
+                            )
+                            unused_text.discard(key)
+                        else:
+                            content = old_imp.load_text("model", resource)
+                        exp.save_text("model", resource, content)
+
+                    if unused_text:
+                        logger.warning(
+                            "The following --replace targets were not used "
+                            "(expected model/config.yaml or model/package_metadata.txt): "
+                            + ", ".join(f"{p}/{r}" for p, r in unused_text)
+                        )
+
+                    # model pickles: load from old package and re-save (weights preserved)
+                    for compile_mode in available_models:
+                        with _cpu_deserialize_always():
+                            model_dict = old_imp.load_pickle(
+                                package="model",
+                                resource=f"{compile_mode}_model.pkl",
+                                map_location="cpu",
+                            )
+                        exp.save_pickle(
+                            "model",
+                            f"{compile_mode}_model.pkl",
+                            model_dict,
+                            dependencies=True,
+                        )
+
+            # verify predictions are unchanged using the original example data
+            with _suppress_package_importer_exporter_warnings():
+                new_imp = torch.package.PackageImporter(tmp_path)
+                with _cpu_deserialize_always():
+                    new_module_dict = new_imp.load_pickle(
+                        package="model",
+                        resource=f"{_EAGER_MODEL_KEY}_model.pkl",
+                        map_location="cpu",
+                    )
+            new_model = new_module_dict[_SOLE_MODEL_KEY]
+            new_model.eval()
+
+            def _error_msg(key, tol, err, absval, model_dtype):
+                return (
+                    f"package update verification failed for field `{key}`: "
+                    f"MaxAbsError {err:.6g} exceeds tolerance {tol} ({model_dtype} model), "
+                    f"MaxAbs value {absval:.6g}. "
+                    f"Set NEQUIP_FLOAT32_MODEL_TOL / NEQUIP_FLOAT64_MODEL_TOL to adjust."
+                )
+
+            test_model_output_similarity_by_dtype(
+                ref_model,
+                new_model,
+                old_example_data,
+                model_dtype,
+                error_message=_error_msg,
+            )
+
+            shutil.move(tmp_path, args.output_path)
+        except:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        logger.info(
+            f"Updated package saved to {args.output_path} (predictions verified)"
+        )
+        return
+
+    elif args.command == "modify":
+        assert_package_extension(args.input_path, "input package path")
+        assert_package_extension(args.output_path, "output package path")
+        assert args.input_path.resolve() != args.output_path.resolve(), (
+            "input and output paths must differ"
+        )
+
+        # parse --modifier NAME [key=value ...] into modifier config dicts
+        modifiers_config = []
+        for item in args.modifier:
+            name = item[0]
+            kwargs = {}
+            for kv in item[1:]:
+                k, v = kv.split("=", 1)
+                kwargs[k] = yaml.safe_load(v)
+            modifiers_config.append({"modifier": name, **kwargs})
+
+        with _suppress_package_importer_exporter_warnings():
+            old_imp = torch.package.PackageImporter(args.input_path)
+            pkg_metadata = _get_package_metadata(old_imp)
+            with _cpu_deserialize_always():
+                old_example_data = old_imp.load_pickle("model", "example_data.pkl")
+                eager_dict = old_imp.load_pickle(
+                    package="model",
+                    resource=f"{_EAGER_MODEL_KEY}_model.pkl",
+                    map_location="cpu",
+                )
+
+        # validate: modifiers must be registered, persistent, and public
+        avail = get_all_modifiers(eager_dict[_SOLE_MODEL_KEY])
+        for cfg in modifiers_config:
+            name = cfg["modifier"]
+            if name not in avail:
+                persistent_public = [
+                    n
+                    for n, f in avail.items()
+                    if is_persistent_model_modifier(f)
+                    and not is_private_model_modifier(f)
+                ]
+                raise ValueError(
+                    f"`{name}` is not a registered modifier. "
+                    f"Available persistent public modifiers: {persistent_public}"
+                )
+            if not is_persistent_model_modifier(avail[name]):
+                raise ValueError(
+                    f"`{name}` is not a persistent modifier; `nequip-package modify` only applies persistent modifiers"
+                )
+            if is_private_model_modifier(avail[name]):
+                raise ValueError(f"`{name}` is a private modifier")
+
+        with tempfile.NamedTemporaryFile(suffix=".nequip.zip", delete=False) as tmp:
+            tmp_path = pathlib.Path(tmp.name)
+        try:
+            with _suppress_package_importer_exporter_warnings():
+                importers = (old_imp, torch.package.importer.sys_importer)
+                with torch.package.PackageExporter(tmp_path, importer=importers) as exp:
+                    exp.mock([f"{pkg}.**" for pkg in _MOCK_MODULES])
+                    exp.extern([f"{pkg}.**" for pkg in _EXTERNAL_MODULES])
+                    exp.intern([f"{pkg}.**" for pkg in _INTERNAL_MODULES])
+
+                    exp.save_pickle(
+                        "model", "example_data.pkl", old_example_data, dependencies=True
+                    )
+                    for resource in ["config.yaml", "package_metadata.txt"]:
+                        exp.save_text(
+                            "model", resource, old_imp.load_text("model", resource)
+                        )
+
+                    for compile_mode in pkg_metadata["available_models"]:
+                        with _cpu_deserialize_always():
+                            model_dict = old_imp.load_pickle(
+                                package="model",
+                                resource=f"{compile_mode}_model.pkl",
+                                map_location="cpu",
+                            )
+                        modify(model_dict, modifiers_config)
+                        exp.save_pickle(
+                            "model",
+                            f"{compile_mode}_model.pkl",
+                            model_dict,
+                            dependencies=True,
+                        )
+
+            shutil.move(tmp_path, args.output_path)
+        except:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        logger.info(f"Modified package saved to {args.output_path}")
+        return
+
+    elif args.command == "info":
+        assert_package_extension(args.pkg_path)
 
         with _suppress_package_importer_exporter_warnings():
             imp = torch.package.PackageImporter(args.pkg_path)
@@ -155,9 +565,7 @@ def main(args=None):
     elif args.command == "build":
         set_workflow_state("package")
 
-        assert str(args.output_path).endswith(".nequip.zip"), (
-            "output path must end with the `.nequip.zip` extension"
-        )
+        assert_package_extension(args.output_path, "output package path")
 
         # === handle internal and external modules ===
         overlap = set(_INTERNAL_MODULES) & set(_EXTERNAL_MODULES)
@@ -232,12 +640,14 @@ def main(args=None):
             # e.g. if the original package was made with torch<2.6, and we're doing the current packaging with torch>=2.6, we'll miss the `compile` model, but there's nothing we can do about it
             package_compile_modes = _get_package_metadata(imp)["available_models"]
         else:
-            if _TORCH_GE_2_6:
-                # allow everything (including compile models)
-                package_compile_modes = _COMPILE_MODE_OPTIONS.copy()
-            else:
-                # only allow eager model if not torch>=2.6
-                package_compile_modes = [_EAGER_MODEL_KEY]
+            assert args.mode in _PACKAGING_MODES, (
+                f"unknown packaging mode '{args.mode}'. "
+                f"Available modes: {list(_PACKAGING_MODES.keys())}"
+            )
+            package_compile_modes = _PACKAGING_MODES[args.mode]()
+            assert _EAGER_MODEL_KEY in package_compile_modes, (
+                f"packaging mode '{args.mode}' must include '{_EAGER_MODEL_KEY}'"
+            )
 
         # remove eager model since we already built it
         package_compile_modes.remove(_EAGER_MODEL_KEY)

@@ -8,6 +8,58 @@ Most recent change on the top.
 
 ## Unreleased
 
+## [0.19.1]
+
+### Added
+- docs page for the NequIP [foundation potentials](https://doi.org/10.48550/arXiv.2607.28461), with links to fine-tuning, compilation and the benchmarks reported in the paper, and citation instructions (`CITATION.bib`, `README`, docs) for using them
+- `TorchProfilerCallback` for profiling training with `torch.profiler`
+- `NEQUIP_NODE_PARALLEL_COMPILE` environment variable (`1`/`true`/`yes`/`y`) to serialize the first train-time compile within each node. Intended for large multi-node jobs, where every rank generating the same kernels at once against a shared cache directory on a parallel filesystem can crash or hang. Off by default.
+
+### Fixed
+- multi-rank checkpoint resume restoring tensors onto the GPU index recorded in the checkpoint rather than each rank's own device: `SimpleDDPStrategy` now moves the model to its device before restoring state (which also avoids `openequivariance` modules wedging when state is restored onto them beforehand), and loads model, optimizer, and EMA state directly onto that device
+- excessive host memory use when resuming from a checkpoint: `nequip-train` held two full copies of the checkpoint in CPU memory at once (one to read hyperparameters and the run index, one from `load_from_checkpoint`); the first is now freed before the second load, and the second is loaded with `map_location="cpu"`
+- https://github.com/mir-group/nequip/issues/612: `Expected all tensors to be on the same device` when loading a CUDA-built package on a CUDA-visible machine, seen as `nequip-package update` failing its own verification: e3nn's `CodeGenMixin` serializes generated `fx.GraphModule`s as opaque nested pickles whose storages carry an absolute device tag and are unreachable by `map_location`, so the Wigner-3j buffers stayed on `cuda:0` while the rest of the model loaded on CPU; the CPU-remapping context manager added for CPU-only hosts is now applied unconditionally
+- silently NaN parameter gradients (and hence all-NaN metrics from the first optimization step) under train-time compile (`compile_mode: compile`) for frames with a zero-volume cell, e.g. non-periodic data, for which ASE supplies an all-zero cell: stress is `virial / volume`, and although it is unused by the loss, AOTAutograd bakes every output's backward into the joint graph and hands unused outputs a materialized zero tangent, so `0/0` produced a NaN that merged into the displacement gradient shared with forces and poisoned every parameter gradient (eager never schedules that branch, so it was unaffected); zero-volume frames now get NaN stress from a division that never sees a zero denominator
+- `nequip-compile` failing on PyTorch 2.13 with `RuntimeError: PyTorch is checking whether allow_tf32 is enabled for cuDNN ...` for both `--device cuda` and `--device cpu` on machines with a CUDA-enabled build: 2.13 propagates `torch.backends.fp32_precision` to cuDNN, whose legacy `allow_tf32` flag cannot encode `"ieee"` and raises when `torch.export` snapshots it; the legacy flag is now kept in sync, leaving all `fp32_precision` values (and hence numerics) untouched
+- train-time compile (`compile_mode: compile`) crashing on PyTorch 2.12 with `derivative for aten::silu_backward is not implemented`: 2.12 keeps `make_fx`'s decomposition table in a thread-local contextvar not seen by the autograd backward worker thread, so the `silu_backward` patch was skipped; tracing is now single-threaded on 2.12 to keep the table visible (no-op on other versions)
+- silent wrong forces in the torch-sim integration for batched evaluation: `NequIPTorchSimCalc` used a cached system count, so a batch reusing the previous call's atomic numbers with a different number of systems (e.g. monatomic cells) used a stale layout; the system count now comes from the input state's cell batch dimension
+
+## [0.19.0]
+
+### Added
+- `nequip-package list`: list the contents (with file sizes) of a packaged model file
+- `nequip-package diff`: diff a file inside a package against its installed or a local version; useful to check for code drift between the packaged snapshot and the currently installed libraries
+- `nequip-package update`: replace specific files inside a package and verify that model predictions are unchanged; intended for applying bug-fixes or compatibility patches without retraining
+- `nequip-package modify`: apply one or more persistent model modifiers to a packaged model (e.g. adjust per-type energy scales/shifts, toggle force/stress output)
+- per-species force loss weighting: `per_type_coeffs` key on `MetricsManager` metrics, and `per_type_forces_coeffs` kwarg on `EnergyForceLoss` and `EnergyForceStressLoss` for emphasizing some atom types over others in the forces loss (weighted-mean aggregation over per-type MSEs)
+- AOTI-packaged models now record the custom-op libraries their GPU kernels require (e.g. `openequivariance`) and import them automatically at load time, so packaged models with custom GPU kernels can be loaded in plain Python without first manually importing the kernel library (only applies to models packaged with this version or later; previously packaged models do not carry this metadata and still require manual import)
+
+### Changed
+
+- [Breaking] `MetricsManager` internal refactor: the `metrics` attribute (a `dict` of `dict`s) has been replaced by `entries` (a `dict` of `MetricEntry` dataclasses). Existing checkpoints are incompatible. Callbacks and code that accessed `loss.metrics[name]["coeff"]` must be updated to `loss.entries[name].coeff`; affected built-in callbacks: `SoftAdaptCallback`, `LossCoeffScheduler`, `LossCoeffMonitor`.
+- [Breaking] minimum `lightning` requirement raised to `>=2.6` (from `>=2.0`); environments pinned to older lightning must upgrade. Checkpoint loading now passes `weights_only=False` to accommodate lightning 2.6's new `weights_only=True` default
+
+### Fixed
+
+- https://github.com/mir-group/nequip/issues/601
+- silent wrong forces/stress in the torch-sim integration: non-contiguous input tensors (e.g. the transposed `row_vector_cell` from `torch_sim.concatenate_states`/`BinningAutoBatcher`, or stride-0 expanded PBC) were read by AOTI models using assumed strides; all model inputs are now made contiguous
+- double-backward overflow in large models: `silu_backward` is now evaluated via the `torch.sigmoid` primitive (instead of the `1/(1+exp(-x))` sigmoid expansion) through a patched AOTI decomposition table
+
+## [0.18.0]
+
+### Added
+- XPU support for training and inference on Aurora
+- Muon optimizer support
+- validation-time XYZ file writer callback support
+- `MappedFieldModifier` for mapped field transformations
+
+### Changed
+- train-time compilation now uses `fullgraph=False`
+
+### Fixed
+- https://github.com/mir-group/nequip/issues/592
+- LAMMPS ML-IAP with type-dependent cutoffs bug
+
 ## [0.17.1]
 
 ### Added
@@ -30,7 +82,7 @@ Most recent change on the top.
 - overhauled `NonperiodicCellTransform` with improved handling
 - models compiled for training now produce full set of eager output dict entries
 - `NequIPCalculator` canonical import path is now `nequip.integrations.ase.NequIPCalculator`; `nequip.ase.NequIPCalculator` remains as a deprecated compatibility shim that emits a `FutureWarning`
-- [breaking] `NEQUIP_NL` environment variable no longer controls neighborlist backend selection. Neighborlist backend can be set explicitly via `NeighborListTransform(..., backend="...")`; default behavior is unchanged (`matscipy`).
+- [Breaking] `NEQUIP_NL` environment variable no longer controls neighborlist backend selection. Neighborlist backend can be set explicitly via `NeighborListTransform(..., backend="...")`; default behavior is unchanged (`matscipy`).
 - Added `register_neighborlist_backend` to support extensible neighborlist backend registration.
 
 ### Fixed

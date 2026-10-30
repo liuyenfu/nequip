@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from nequip.data import AtomicDataDict
-from nequip.data.transforms.neighborlist import NeighborListTransform
+from nequip.data.transforms.neighborlist import NeighborListPruneTransform
 from nequip.nn import graph_model
 from nequip.model.saved_models.load_utils import load_saved_model
 from nequip.model.modify_utils import get_all_modifiers, modify
@@ -23,7 +23,7 @@ except ModuleNotFoundError:
         "See https://nequip.readthedocs.io/en/latest/integrations/lammps/mliap.html for installation instructions."
     )
 
-from typing import List
+from typing import List, Optional
 
 
 class NequIPLAMMPSMLIAPWrapper(MLIAPUnified):
@@ -36,7 +36,7 @@ class NequIPLAMMPSMLIAPWrapper(MLIAPUnified):
         self,
         model_path: str,
         model_key: str,
-        modifiers: List[str] = [],
+        modifiers: Optional[List[str]] = None,
         compile: bool = True,
         tf32: bool = False,
         **kwargs,
@@ -55,12 +55,12 @@ class NequIPLAMMPSMLIAPWrapper(MLIAPUnified):
         self.model_filename = Path(model_path).name
 
         self.model_key = model_key
-        self.modifiers = modifiers
+        self.modifiers = [] if modifiers is None else modifiers
         self.compile = compile
         self.tf32 = tf32
         self.model = None
         self.device = None
-        self.nl = None
+        self.nl_pruner = None
 
         # to placate the interface
         self.nparams = 1
@@ -119,9 +119,10 @@ class NequIPLAMMPSMLIAPWrapper(MLIAPUnified):
         if "disable_ForceStressOutput" in available_modifiers:
             model = modify(model, [{"modifier": "disable_ForceStressOutput"}])
         else:
-            # very bad hack, but left for backwards compatibility
-            # TODO: remove in the future as a breaking change
-            # assumes model is `GraphModel(StressForceOutput(EnergyModel))`
+            if not hasattr(model, "model") or not hasattr(model.model, "func"):
+                raise RuntimeError(
+                    "LAMMPS MLIAP requires `disable_ForceStressOutput` or a model with `model.func` fallback."
+                )
             model.model = model.model.func
 
         # NOTE: this is a hack/workaround because modifiers like NequIP-OEQ condition modification logic around whether `torch.compile` will be called
@@ -153,16 +154,16 @@ class NequIPLAMMPSMLIAPWrapper(MLIAPUnified):
         else:
             self.model = model
 
-        # instantiate NeighborListTransform for per-edge-type cutoff pruning
+        # instantiate pruning transform for per-edge-type cutoff pruning
         per_edge_type_cutoff = model.metadata.get("per_edge_type_cutoff", None)
         if per_edge_type_cutoff is not None:
-            self.nl = NeighborListTransform(
+            self.nl_pruner = NeighborListPruneTransform(
                 r_max=float(model.metadata[graph_model.R_MAX_KEY]),
                 per_edge_type_cutoff=per_edge_type_cutoff,
                 type_names=model.type_names,
             )
-            self.nl._normalizer.to(self.device)
-            # ^ important to set to correct device (typically not needed for training context since data transforms are on CPU)
+            self.nl_pruner.to(self.device)
+            # important to set to correct device (typically not needed for training context since data transforms are on CPU)
 
     def compute_forces(self, lmp_data):
         # === lazily load model ===
@@ -171,6 +172,15 @@ class NequIPLAMMPSMLIAPWrapper(MLIAPUnified):
 
         if lmp_data.nlocal == 0 or lmp_data.npairs <= 1:
             return
+
+        # The LAMMPS arrays read below (rij, pair_i/pair_j) are produced by Kokkos
+        # kernels on a different GPU stream than PyTorch. Without a sync here, the
+        # `torch.as_tensor(...)` reads can race those Kokkos writes, giving stale
+        # indices and an out-of-bounds GPU write during dynamics (non-deterministic;
+        # `run 0` is fine; hidden by HIP/CUDA_LAUNCH_BLOCKING=1). The input-side sync
+        # is sufficient. ~0.8% overhead on a GPU-bound workload.
+        if self.device != "cpu":
+            torch.cuda.synchronize()
 
         # === create input data ===
 
@@ -209,8 +219,8 @@ class NequIPLAMMPSMLIAPWrapper(MLIAPUnified):
         }
 
         # === apply per-edge-type cutoff pruning if available ===
-        if self.nl is not None:
-            nequip_data_in = self.nl._apply_per_edge_type_cutoffs(nequip_data_in)
+        if self.nl_pruner is not None:
+            nequip_data_in = self.nl_pruner(nequip_data_in)
 
         # === run model ===
         # make sure edge vectors `requires_grad`
@@ -242,9 +252,9 @@ class NequIPLAMMPSMLIAPWrapper(MLIAPUnified):
 
         # update LAMMPS variables
         lmp_eatoms = torch.as_tensor(lmp_data.eatoms)
-        lmp_eatoms.copy_(nequip_atomic_energies)
-        lmp_data.energy = nequip_total_energy
-        lmp_data.update_pair_forces_gpu(edge_forces)
+        lmp_eatoms.copy_(nequip_atomic_energies.detach())
+        lmp_data.energy = nequip_total_energy.detach()
+        lmp_data.update_pair_forces_gpu(edge_forces.detach())
 
     def compute_descriptors(self, lmp_data):
         pass

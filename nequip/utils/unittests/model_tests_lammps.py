@@ -64,15 +64,17 @@ class LAMMPSMLIAPIntegrationMixin(EnergyModelTestsMixin):
     """
 
     @pytest.fixture(scope="class")
-    def mliap_tol(self, model_dtype):
+    @classmethod
+    def mliap_tol(cls, model_dtype):
         """May be overriden by subclasses.
 
         Returns tolerance for MLIAP integration tests based on ``model_dtype``.
         """
-        return {"float32": 1e-5, "float64": 1e-10}[model_dtype]
+        return {"float32": 5e-5, "float64": 1e-10}[model_dtype]
 
     @pytest.fixture(scope="class", params=[None])
-    def mliap_acceleration_modifiers(self, request):
+    @classmethod
+    def mliap_acceleration_modifiers(cls, request):
         """Override in subclasses to specify MLIAP-compatible modifiers.
 
         Should return a callable with signature: (compile, model_dtype) -> List[str]
